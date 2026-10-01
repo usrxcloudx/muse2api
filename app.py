@@ -114,17 +114,17 @@ async def _http_exc(request: Request, exc: HTTPException):
 async def _validation_exc(request: Request, exc: RequestValidationError):
     if request.url.path.startswith("/v1/"):
         return JSONResponse(status_code=422, content={"error": {
-            "message": "请求参数校验失败：" + str(exc.errors())[:400],
+            "message": "Request parameter validation failed: " + str(exc.errors())[:400],
             "type": "invalid_request_error", "param": None, "code": 422}})
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 MODELS = [
     {"id": "muse-spark", "object": "model", "owned_by": "muse",
-     "description": "Muse Spark —— 文本 / 代码对话（网页免费额度，支持流式）"},
+     "description": "Muse Spark — Text and code conversations (supports streaming)"},
     {"id": "muse-image", "object": "model", "owned_by": "muse",
-     "description": "Muse Image —— 文生图 / 图像编辑（网页免费额度）"},
+     "description": "Muse Image — Text-to-image and image editing"},
     {"id": "muse-video", "object": "model", "owned_by": "muse",
-     "description": "Muse Video —— 文生视频 / 图生视频（网页免费额度）"},
+     "description": "Muse Video — Text-to-video and image-to-video"},
 ]
 
 # 下游（Codex / Cline / 各种客户端）习惯按 OpenAI、Anthropic 的名字传模型，
@@ -170,11 +170,11 @@ def auth(authorization: str | None = Header(default=None)):
     if not CFG.api_key:
         return True
     if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "缺少 Authorization: Bearer <key>")
+        raise HTTPException(401, "Missing Authorization: Bearer ***")
     parts = authorization.split(None, 1)
     token = parts[1].strip() if len(parts) > 1 else ""
     if not token or token != CFG.api_key:
-        raise HTTPException(401, "API key 无效")
+        raise HTTPException(401, "Invalid API key")
     return True
 
 
@@ -203,7 +203,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
                                  cookies_exp=res.get("cookies_exp"),
                                  ok=True if res.get("ok") else acc.get("ok"),
                                  synced_at=int(now))
-            store.touch_keepalive(acc_id, True, f"会话正常 (VM: {res.get('vm_state') or 'RUNNING'})")
+            store.touch_keepalive(acc_id, True, f"Session active (VM: {res.get('vm_state') or 'RUNNING'})")
     except MuseAuthError as exc:
         store.mark(acc_id, False, str(exc))
         raise
@@ -227,7 +227,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         cur_exp = expires
         last_exc = None
         try:
-            for attempt in range(2):
+            total_accs = len([a for a in store.list_accounts() if a.get("enabled", True)])
+            max_chat_attempts = 2 if total_accs > 1 else 1
+            for attempt in range(max_chat_attempts):
                 if stop_event.is_set():
                     return
                 if attempt > 0:
@@ -379,35 +381,49 @@ class AccountPatch(BaseModel):
 
 # ------------------------- 提示词构造 -------------------------
 def build_image_prompt(r: ImageRequest) -> str:
+    # 提取干净的 prompt，去除可能附带的 Hermes skill 包装
+    raw_prompt = (r.prompt or "").strip()
+    m = re.search(r"The user has provided the following instruction alongside the skill invocation:\s*(.*)", raw_prompt, re.DOTALL | re.IGNORECASE)
+    if m:
+        raw_prompt = m.group(1).strip()
+    elif raw_prompt.startswith("[IMPORTANT:") and ("\n" in raw_prompt):
+        lines = [line.strip() for line in raw_prompt.splitlines() if line.strip()]
+        if lines:
+            last = lines[-1]
+            if not last.startswith(("```", "#", "-", "*", "[Skill")):
+                raw_prompt = last
+
     has_ref = bool(r.reference_image or r.image or r.images)
     if has_ref:
-        parts = [f"基于我本次上传附带的参考图片进行生图/编辑：{r.prompt.strip()}"]
+        parts = [f"Image generation/editing based on attached reference image: {raw_prompt}"]
     else:
-        parts = [f"全新文生图创作（当前未提供任何参考图，请勿查找历史相册或向用户索要原图，直接根据文字描述从零绘制生成一张全新图片）：{r.prompt.strip()}"]
+        # Nếu prompt đã có chỉ thị rõ ràng (như 'tạo cho tôi hình ảnh...', 'draw...', 'generate...')
+        # thì truyền trực tiếp prompt sạch để muse.ai xử lý tự nhiên nhất, tránh nhồi ngữ cảnh dài dòng
+        parts = [raw_prompt]
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
 
     if any(k in ar or k in sz for k in ("9:16", "9/16", "portrait", "竖屏", "720x1280", "1080x1920")):
-        parts.append("【画面构图与比例要求】：严格 9:16 竖屏满屏画幅（9:16 vertical portrait aspect ratio，高大于宽的手机全屏竖版画面），绝对不要生成横屏，保持垂直构图")
+        parts.append("[Composition and aspect ratio requirement]: strictly 9:16 vertical portrait aspect ratio, vertical composition")
     elif any(k in ar or k in sz for k in ("16:9", "16/9", "landscape", "横屏", "1280x720", "1920x1080")):
-        parts.append("【画面构图与比例要求】：16:9 宽屏横屏画幅（16:9 widescreen landscape aspect ratio）")
+        parts.append("[Composition and aspect ratio requirement]: 16:9 widescreen landscape aspect ratio")
     elif any(k in ar or k in sz for k in ("1:1", "square", "正方形", "1024x1024")):
-        parts.append("【画面构图与比例要求】：1:1 正方形画幅（1:1 square aspect ratio）")
+        parts.append("[Composition and aspect ratio requirement]: 1:1 square aspect ratio")
     elif any(k in ar or k in sz for k in ("4:3", "4/3")):
-        parts.append("【画面构图与比例要求】：4:3 比例画幅")
+        parts.append("[Composition and aspect ratio requirement]: 4:3 aspect ratio")
     elif any(k in ar or k in sz for k in ("3:4", "3/4")):
-        parts.append("【画面构图与比例要求】：3:4 竖向画幅")
+        parts.append("[Composition and aspect ratio requirement]: 3:4 portrait aspect ratio")
     elif r.aspect_ratio:
-        parts.append(f"【画面构图与比例要求】：{r.aspect_ratio} 画面比例")
+        parts.append(f"[Composition and aspect ratio requirement]: {r.aspect_ratio} aspect ratio")
     elif r.size:
-        parts.append(f"尺寸/比例：{r.size}")
+        parts.append(f"Size/Aspect ratio: {r.size}")
 
     if has_ref:
-        parts.append("【纯净画面要求】：彻底清除并去除参考图中的所有文字、水印、签名、角标及Logo标记（clean image without any watermark, text, or logo），输出绝对纯净无字画面")
+        parts.append("[Clean image requirement]: clean image without any watermark, text, signature, or logo")
 
     if r.extra:
         parts.append(r.extra)
-    return "，".join(parts)
+    return ", ".join(parts)
 
 
 def _content_text(content) -> str:
@@ -424,7 +440,7 @@ def _content_text(content) -> str:
                 if t in (None, "text", "input_text", "output_text"):
                     parts.append(str(item.get("text") or ""))
                 elif t == "image_url":
-                    parts.append("[图片]")
+                    parts.append("[Image]")
             elif isinstance(item, str):
                 parts.append(item)
         return "\n".join(p for p in parts if p)
@@ -445,20 +461,46 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
         if role == "tool":
             # 工具执行结果 → 当成"用户提供的信息"发过去
             if text:
-                turns.append(("user", "【工具执行结果】\n" + text))
+                turns.append(("user", "[Tool Execution Result]\n" + text))
             continue
         if not text:
             # 部分客户端的 assistant 消息只带 tool_calls、没有正文
             if role == "assistant" and m.tool_calls:
-                turns.append(("assistant", "【请求调用工具】" + json.dumps(
+                turns.append(("assistant", "[Request Tool Call] " + json.dumps(
                     m.tool_calls, ensure_ascii=False)[:600]))
             continue
         if role in ("system", "developer"):
+            # 过滤掉 agent 客户端注入的庞大 system prompt/instructions（避免污染 muse.ai 界面）
+            if any(k in text for k in (
+                "You are Hermes", "available_skills", "Hermes runtime environment",
+                "Finish the job", "Tool-use enforcement", "[IMPORTANT:"
+            )):
+                continue
             system.append(text)
         else:
             turns.append((role, text))
 
-    # 单轮且无系统指令 → 直接发原文，最贴近自然对话
+    # 提取并清理用户消息（如果有 Hermes / Agent 的 skill 包装，剥离出纯净指令）
+    clean_turns = []
+    for role, text in turns:
+        if role == "user":
+            m = re.search(r"The user has provided the following instruction alongside the skill invocation:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+            if m:
+                text = m.group(1).strip()
+            elif text.startswith("[IMPORTANT:") and ("\n" in text):
+                lines = [line.strip() for line in text.splitlines() if line.strip()]
+                if lines:
+                    last = lines[-1]
+                    if not last.startswith(("```", "#", "-", "*", "[Skill")):
+                        text = last
+        clean_turns.append((role, text))
+    turns = clean_turns
+
+    # 只有一轮用户提问（绝大多数情况） → 直接发原文，最贴近自然对话，绝不带 Context / Instructions 前缀
+    if len(turns) == 1 and turns[0][0] == "user":
+        return turns[0][1]
+
+    # 单轮且无系统指令 → 直接发原文
     if len(turns) == 1 and not system and turns[0][0] == "user":
         return turns[0][1]
 
@@ -466,10 +508,10 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
     if system:
         sys_text = "\n\n".join(system)
         sys_text = sys_text.replace("danger-full-access", "standard-workspace-access")
-        parts.append(f"背景与任务设定：\n{sys_text}")
+        parts.append(f"Context and Instructions:\n{sys_text}")
     for role, text in turns:
-        label = "助手" if role == "assistant" else "用户"
-        parts.append(f"{label}：\n{text}")
+        label = "Assistant" if role == "assistant" else "User"
+        parts.append(f"{label}:\n{text}")
     return "\n\n".join(parts)
 
 
@@ -481,32 +523,32 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
 #
 # 注意：这是"尽力适配"而非保证 —— 目标模型是通用对话模型，没有针对
 # function calling 做微调，遵守协议的程度需要实测观察。
-_TOOL_PROTOCOL_HEAD = """你可以根据需要调用以下工具来协助用户完成任务。
-若需调用工具，请直接输出如下格式的 JSON 代码块（不要包含其他多余解释）：
+_TOOL_PROTOCOL_HEAD = """You can call the following tools if needed to assist the user in completing tasks.
+If you need to call a tool, please output a JSON code block in the following format directly (without additional explanations):
 ```json
-{"name": "<工具名>", "arguments": {<参数>}}
+{"name": "<tool_name>", "arguments": {<arguments>}}
 ```
-如果需要调用多个工具，请输出包含多个对象的 JSON 数组。
-如果无需调用工具，请直接用自然语言回答。
+If you need to call multiple tools, please output a JSON array of objects.
+If no tool call is needed, please answer directly in natural language.
 
-可用工具列表：
+Available tools:
 """
 
 
 def _describe_params(params) -> str:
     """把 JSON Schema 的参数描述成易读的多行文本。"""
     if not isinstance(params, dict):
-        return "      （无参数）"
+        return "      (No parameters)"
     props = params.get("properties") or {}
     required = set(params.get("required") or [])
     if not props:
-        return "      （无参数）"
+        return "      (No parameters)"
     lines = []
     for name, spec in props.items():
         spec = spec if isinstance(spec, dict) else {}
         lines.append("      - %s (%s, %s)%s" % (
             name, spec.get("type") or "any",
-            "必填" if name in required else "可选",
+            "required" if name in required else "optional",
             (" " + spec["description"]) if spec.get("description") else ""))
     return "\n".join(lines)
 
@@ -527,7 +569,7 @@ def build_tools_prompt(tools: list | None) -> str:
         if not fn.get("name"):
             continue
         desc = fn.get("description") or ""
-        items.append("%d. %s%s\n   参数：\n%s" % (
+        items.append("%d. %s%s\n   Parameters:\n%s" % (
             len(items) + 1, fn["name"], (" — " + desc) if desc else "",
             _describe_params(fn.get("parameters"))))
     if not items:
@@ -605,7 +647,18 @@ def parse_tool_calls(text: str) -> tuple[list[dict] | None, str]:
 
 
 def build_video_prompt(r: VideoRequest) -> str:
-    user_prompt = r.prompt.strip()
+    user_prompt = (r.prompt or "").strip()
+    # 剥离可能附带的 Hermes skill 包装
+    m = re.search(r"The user has provided the following instruction alongside the skill invocation:\s*(.*)", user_prompt, re.DOTALL | re.IGNORECASE)
+    if m:
+        user_prompt = m.group(1).strip()
+    elif user_prompt.startswith("[IMPORTANT:") and ("\n" in user_prompt):
+        lines = [line.strip() for line in user_prompt.splitlines() if line.strip()]
+        if lines:
+            last = lines[-1]
+            if not last.startswith(("```", "#", "-", "*", "[Skill")):
+                user_prompt = last
+
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
     dur = r.duration or 6
@@ -614,27 +667,20 @@ def build_video_prompt(r: VideoRequest) -> str:
     is_vertical = any(k in ar or k in sz for k in ("9:16", "9/16", "portrait", "竖屏", "720x1280", "1080x1920"))
 
     parts = []
-    if is_vertical:
-        if has_ref:
-            parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成一个严格9:16竖屏手机满屏的动态图生视频（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严格以附带的参考图为起始第一帧延续动作，严禁生成横屏或黑边，时长严格为 {dur} 秒）：{user_prompt}")
+    if has_ref:
+        if is_vertical:
+            parts.append(f"Generate an animated image-to-video based on reference image (vertical 9:16, duration {dur}s): {user_prompt}")
         else:
-            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个严格9:16竖屏手机满屏视频（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或带有左右黑边，保持垂直构图，时长严格为 {dur} 秒）：{user_prompt}")
-    elif any(k in ar or k in sz for k in ("16:9", "16/9", "landscape", "横屏", "1280x720", "1920x1080")):
-        if has_ref:
-            parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成一个16:9宽屏横屏图生视频（16:9 widescreen landscape video，严格以附带的参考图为起始第一帧延续动作，时长严格为 {dur} 秒）：{user_prompt}")
-        else:
-            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个16:9横屏宽屏视频（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"Generate an animated image-to-video based on reference image (16:9, duration {dur}s): {user_prompt}")
     else:
-        if has_ref:
-            parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成动态图生视频（严格以附带的参考图为起始第一帧延续动作，时长严格为 {dur} 秒）：{user_prompt}")
-        else:
-            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个视频（时长严格为 {dur} 秒）：{user_prompt}")
+        # Nếu không có ref image, gửi prompt trực tiếp để tránh thêm ngữ cảnh dài dòng
+        parts.append(user_prompt)
 
     if r.resolution:
-        parts.append(f"画质规格：{r.resolution}")
+        parts.append(f"Resolution: {r.resolution}")
     if r.extra:
         parts.append(r.extra)
-    return "，".join(parts)
+    return ", ".join(parts)
 
 
 def media_url(name: str) -> str:
@@ -742,7 +788,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
     # Browser ownership covers account selection, retry and cleanup, not just generate().
     deadline = time.monotonic() + max(1, timeout)
     if not GEN_LOCK.acquire(timeout=max(1, timeout)):
-        raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
+        raise MuseGenerationError("Waiting for browser queue timed out, please try again later")
     try:
         return _run_generation_locked(prompt, kind, timeout, account_id,
                                       on_progress, reference_image, deadline=deadline)
@@ -759,15 +805,18 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     if not acc:
         acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
     if not acc:
-        raise MuseAuthError("没有可用账号，请先在管理页面导入 cookie")
+        raise MuseAuthError("No available accounts, please import cookies in the admin console first")
 
     last_exc = None
     cur_acc = acc
-    for attempt in range(2):
+    # Chỉ thử đúng 1 lần nếu chỉ có 1 tài khoản duy nhất, tránh gọi lặp sinh ra 2 hội thoại/2 ảnh
+    total_accs = len([a for a in store.list_accounts() if a.get("enabled", True)])
+    max_attempts = 2 if total_accs > 1 else 1
+    for attempt in range(max_attempts):
         if deadline is not None and time.monotonic() >= deadline:
-            raise MuseGenerationError("任务总等待时限已到，停止重试")
+            raise MuseGenerationError("Task total timeout reached, stopping retries")
         if attempt > 0:
-            if last_exc and "未产出媒体附件，仅返回了文本回复" in str(last_exc):
+            if last_exc and any(k in str(last_exc) for k in ("未产出媒体附件，仅返回了文本回复", "Model did not generate media")):
                 break
             alt = store.pick_account(rotate=True, force_rotate=True, exclude_id=cur_acc["id"])
             if not alt or alt["id"] == cur_acc["id"]:
@@ -781,7 +830,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             engine.start()
             remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
             if remaining <= 0:
-                raise MuseGenerationError("任务总等待时限已到，停止重试")
+                raise MuseGenerationError("Task total timeout reached, stopping retries")
             res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
                                   timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                   account_id=cur_acc["id"], on_progress=on_progress,
@@ -795,14 +844,14 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             engine.stop()
         except MuseGenerationError as exc:
             last_exc = exc
-            store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
+            store.mark(cur_acc["id"], True, f"Task error: {str(exc)[:60]}")
             try:
                 engine.reset_thread()
             except Exception:
                 pass
         except Exception as exc:  # noqa: BLE001
             engine.stop()
-            last_exc = MuseGenerationError(f"生成失败: {exc}")
+            last_exc = MuseGenerationError(f"Generation failed: {exc}")
     raise last_exc
 
 
@@ -908,7 +957,7 @@ def create_image_task(req: ImageRequest,
 def get_image_task(task_id: str, _=Depends(auth)):
     task = store.get_task(task_id)
     if not task or task.get("kind") != "image":
-        raise HTTPException(404, "image task 不存在")
+        raise HTTPException(404, "Image task not found")
     out = dict(task)
     if out.get("status") == "completed":
         req = ImageRequest(prompt=out["prompt"], size=out.get("size"),
@@ -997,7 +1046,7 @@ async def images_edits(request: Request, _=Depends(auth)):
             ref_image_data = body.get("reference_image") or body.get("image_url")
 
     if not prompt:
-        prompt = "参考此图片并进行生图创作"
+        prompt = "Create an image based on this reference picture"
 
     req_obj = ImageRequest(
         prompt=prompt,
@@ -1071,7 +1120,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
 def get_video(task_id: str, _=Depends(auth)):
     t = store.get_task(task_id)
     if not t:
-        raise HTTPException(404, "task 不存在")
+        raise HTTPException(404, "Task not found")
     out = dict(t)
     status = out.get("status")
     if status in ("succeeded", "success", "done"):
@@ -1135,7 +1184,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
     """
     prompt = build_chat_prompt(req.messages) or (req.prompt or "").strip()
     if not prompt:
-        raise HTTPException(400, "messages 为空")
+        raise HTTPException(400, "messages cannot be empty")
 
     # 工具调用协议默认不注入 —— 实测 muse.ai 的助手会明确拒绝输出"伪工具调用"，
     # 注入反而污染正常回答；详见 config.py 的 tool_protocol 注释。
@@ -1146,13 +1195,72 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         prompt = prompt + "\n\n" + tool_note
 
     model = resolve_model(req.model, default="muse-spark")
+    cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+    created = int(time.time())
+
+    # 智能意图识别：如果用户在 chat 对话中要求生成/绘制图片或视频，且未强制走 tools
+    # 自动重定向至真实生成引擎，避免在文本流中无限等待附件导致超时
+    img_kw = (
+        "tạo ảnh", "vẽ ảnh", "sinh ảnh", "vẽ hình", "tạo hình ảnh", "tạo bức ảnh",
+        "vẽ bức ảnh", "tạo hình", "vẽ cho tôi", "tạo cho tôi hình ảnh", "tạo một bức ảnh",
+        "vẽ một bức ảnh", "vẽ tranh", "tạo tranh", "chụp ảnh", "phác họa",
+        "生图", "画图", "生成图片", "绘制", "画一张", "作图", "文生图",
+        "generate image", "create image", "draw an image", "draw a picture",
+        "generate a picture", "paint an image", "make an image", "text to image",
+        "generate an image", "create an image"
+    )
+    vid_kw = (
+        "tạo video", "làm video", "sinh video", "tạo clip", "quay video", "làm clip",
+        "generate video", "create video", "make a video", "text to video", "generate a video"
+    )
+    is_img_req = (model == "muse-image") or (
+        not tool_note and len(prompt) < 1000 and any(k in prompt.lower() for k in img_kw)
+    )
+    is_vid_req = (model == "muse-video") or (
+        not tool_note and len(prompt) < 1000 and any(k in prompt.lower() for k in vid_kw)
+    )
+
+    if is_img_req or is_vid_req:
+        media_kind = "video" if is_vid_req else "image"
+        clean_prompt = prompt
+        for prefix in ("vui lòng ", "hãy ", "làm ơn ", "please ", "can you "):
+            if clean_prompt.lower().startswith(prefix):
+                clean_prompt = clean_prompt[len(prefix):].strip()
+
+        gen_timeout = int(req.timeout or (CFG.video_timeout if is_vid_req else CFG.image_timeout) or 240)
+        try:
+            res, _acc = await asyncio.to_thread(_run_generation, clean_prompt, media_kind, gen_timeout)
+            file_url = media_url(res["filename"])
+            host_media_dir = os.environ.get("MUSE2API_HOST_MEDIA_DIR") or os.path.abspath(CFG.media_dir)
+            host_path = os.path.join(host_media_dir, res["filename"])
+            if is_vid_req:
+                resp_content = f"Dưới đây là video được tạo theo yêu cầu của bạn:\n\n[Generated Video]({file_url})\n\nMEDIA:{host_path}"
+            else:
+                resp_content = f"Dưới đây là hình ảnh được tạo theo yêu cầu của bạn:\n\n![Generated Image]({file_url})\n\nMEDIA:{host_path}"
+            if req.stream:
+                def gen_stream():
+                    yield _sse(_chat_chunk(cid, created, model, {"content": resp_content}))
+                    yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(gen_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+            else:
+                return {
+                    "id": cid, "object": "chat.completion", "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": resp_content}
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                }
+        except Exception as exc:
+            log.warning("Tự động chuyển tiếp sinh media (%s) thất bại, quay về luồng chat thường: %s", media_kind, exc)
+
     timeout = int(req.timeout or CFG.chat_timeout)
     acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
     if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+        raise HTTPException(400, "No available accounts, please import cookies in admin console first")
 
-    cid = "chatcmpl-" + uuid.uuid4().hex[:24]
-    created = int(time.time())
     acc_id = acc["id"]
     cookies = acc["cookies"]
     expires = acc.get("cookies_exp")
@@ -1215,14 +1323,14 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 store.mark(acc_id, False, str(exc))
                 yield _sse({"error": {"message": str(exc), "type": "auth_error", "code": 401}})
             except MuseGenerationError as exc:
-                store.mark(acc_id, True, f"助手超时: {str(exc)[:60]}")
+                store.mark(acc_id, True, f"Assistant timeout: {str(exc)[:60]}")
                 try:
                     engine.reset_thread()
                 except Exception:
                     pass
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 502}})
             except Exception as exc:
-                yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
+                yield _sse({"error": {"message": f"Internal error: {exc}", "type": "server_error", "code": 500}})
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
@@ -1276,10 +1384,10 @@ def _responses_messages(req: ResponsesRequest) -> list[ChatMessage]:
             elif itype == "input_text":
                 msgs.append(ChatMessage(role="user", content=item.get("text")))
             elif itype == "function_call_output":
-                msgs.append(ChatMessage(role="user", content="【工具执行结果】\n"
+                msgs.append(ChatMessage(role="user", content="[Tool Execution Result]\n"
                                         + str(item.get("output") or "")))
             elif itype == "function_call":
-                msgs.append(ChatMessage(role="assistant", content="【请求调用工具】"
+                msgs.append(ChatMessage(role="assistant", content="[Request Tool Call] "
                                         + str(item.get("name") or "")))
     return msgs
 
@@ -1297,13 +1405,13 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     """
     prompt = build_chat_prompt(_responses_messages(req))
     if not prompt:
-        raise HTTPException(400, "input 为空")
+        raise HTTPException(400, "input cannot be empty")
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
     acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
     if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+        raise HTTPException(400, "No available accounts, please import cookies in admin console first")
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]
@@ -1377,10 +1485,10 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 @app.get("/v1/media/{name}")
 def get_media(name: str):
     if "/" in name or "\\" in name or ".." in name:
-        raise HTTPException(400, "非法文件名")
+        raise HTTPException(400, "Invalid filename")
     p = os.path.join(CFG.media_dir, name)
     if not os.path.isfile(p):
-        raise HTTPException(404, "文件不存在")
+        raise HTTPException(404, "File not found")
     return FileResponse(p)
 
 
@@ -1435,14 +1543,14 @@ def add_account(req: AccountRequest, _=Depends(auth)):
                       "expires_at": acc.get("expires_at")})
 
     if not added:
-        raise HTTPException(400, "未解析到任何 cookie，请检查格式")
+        raise HTTPException(400, "No cookies parsed, please check format")
 
     # 只要有一个账号把核心 cookie 凑齐就算通过（批量时按整体判断）
     missing = [n for n in ESSENTIAL_COOKIES
                if not any(n in c for c in seen)]
     return {"added": added, "count": len(added),
             "essential_missing": missing,
-            "warning": (f"缺少核心 cookie：{', '.join(missing)}，该账号可能无法生成"
+            "warning": (f"Missing essential cookies: {', '.join(missing)}, this account may not generate"
                         if missing else "")}
 
 
@@ -1450,7 +1558,7 @@ def add_account(req: AccountRequest, _=Depends(auth)):
 def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
     acc = store.update_account(aid, label=req.label, enabled=req.enabled)
     if not acc:
-        raise HTTPException(404, "账号不存在")
+        raise HTTPException(404, "Account not found")
     return {k: v for k, v in acc.items() if k != "cookies"} | {
         "cookie_count": len(acc.get("cookies", {}))}
 
@@ -1459,7 +1567,7 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
 def del_account(aid: str, _=Depends(auth)):
     ok = store.delete_account(aid)
     if not ok:
-        raise HTTPException(404, "账号不存在")
+        raise HTTPException(404, "Account not found")
     return {"deleted": True, "id": aid}
 
 
@@ -1468,9 +1576,9 @@ async def test_account(aid: str, _=Depends(auth)):
     """真实打开 muse.ai 验证该账号 cookie 是否仍可登录。"""
     acc = store.get_account(aid)
     if not acc:
-        raise HTTPException(404, "账号不存在")
+        raise HTTPException(404, "Account not found")
     if not acc.get("cookies"):
-        raise HTTPException(400, "该账号没有 cookie")
+        raise HTTPException(400, "This account has no cookies")
 
     def _probe():
         with GEN_LOCK:
@@ -1486,8 +1594,8 @@ async def test_account(aid: str, _=Depends(auth)):
                     store.update_account(aid, quota=quota)
                 except Exception:  # noqa: BLE001
                     quota = None
-                store.mark(aid, True, "会话有效")
-                return {"ok": True, "message": "会话有效，可正常生成",
+                store.mark(aid, True, "Active session")
+                return {"ok": True, "message": "Session is active and ready",
                         "synced": synced, "quota": quota}
             except MuseAuthError as exc:
                 store.mark(aid, False, str(exc)[:200])
@@ -1514,17 +1622,17 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
     if payload.get("cookie_header"):
         cookies.update(parse_cookie_text(payload["cookie_header"]))
     if not cookies:
-        raise HTTPException(400, "未解析到 cookie")
+        raise HTTPException(400, "No cookies parsed")
     exp = {k: int(v) for k, v in (payload.get("expires") or {}).items()
            if _pos(v)}
     # 补入的是「全新会话」的 cookie，有效期估算锚点必须重置到当下，
     # 否则会沿用旧会话的锚点，把剩余天数算少。
     acc = store.update_account(aid, cookies=cookies, ok=None,
-                               note="已更新 cookie",
+                               note="Cookies updated",
                                expiry_anchor=int(time.time()),
                                cookies_exp=exp or None)
     if not acc:
-        raise HTTPException(404, "账号不存在")
+        raise HTTPException(404, "Account not found")
     return {"ok": True, "id": aid, "cookie_count": len(cookies),
             "expires_at": acc.get("expires_at")}
 
@@ -1533,7 +1641,7 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
 def relogin(_=Depends(auth)):
     acc = store.pick_account(rotate=True)
     if not acc:
-        raise HTTPException(400, "没有可用账号")
+        raise HTTPException(400, "No available accounts")
     try:
         engine.start()
         engine.refresh(acc["cookies"], acc.get("cookies_exp"))
@@ -1553,9 +1661,9 @@ async def query_quota(aid: str, _=Depends(auth)):
     """
     acc = store.get_account(aid)
     if not acc:
-        raise HTTPException(404, "账号不存在")
+        raise HTTPException(404, "Account not found")
     if not acc.get("cookies"):
-        raise HTTPException(400, "该账号没有 cookie")
+        raise HTTPException(400, "This account has no cookies")
 
     def _probe():
         with GEN_LOCK:
@@ -1573,7 +1681,7 @@ async def query_quota(aid: str, _=Depends(auth)):
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"额度查询失败: {exc}") from exc
+        raise HTTPException(502, f"Quota query failed: {exc}") from exc
 
 
 @app.post("/admin/quota")
@@ -1582,7 +1690,7 @@ async def query_any_quota(_=Depends(auth)):
     通常只有一人使用时够用；多账号时建议按账号查）。"""
     acc = store.pick_account(rotate=True)
     if not acc:
-        raise HTTPException(400, "没有可用账号")
+        raise HTTPException(400, "No available accounts")
     return await query_quota(acc["id"], _)
 
 
@@ -1754,7 +1862,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
     """通过 muse.ai/api/session 触发 Meta 网关签发新 hatch_vml (+48h) / hatch_sess (+30d) 并唤醒云端 VM。"""
     acc = store.get_account(aid)
     if not acc or not acc.get("cookies"):
-        return {"ok": False, "id": aid, "label": (acc or {}).get("label", aid), "error": "账号无有效 cookie"}
+        return {"ok": False, "id": aid, "label": (acc or {}).get("label", aid), "error": "Account has no valid cookies"}
     try:
         res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=True)
         store.update_account(
@@ -1765,7 +1873,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
             synced_at=int(time.time()),
         )
         vm_state = res.get("vm_state") or "RUNNING"
-        store.touch_keepalive(aid, True, f"会话有效 · 自动保活 (VM: {vm_state})")
+        store.touch_keepalive(aid, True, f"Session active · Auto keepalive (VM: {vm_state})")
         quota = acc.get("quota")
         if check_quota and GEN_LOCK.acquire(blocking=False):
             try:
@@ -1789,10 +1897,10 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
             "quota": quota,
         }
     except MuseAuthError as exc:
-        store.touch_keepalive(aid, False, f"保活认证失败: {str(exc)[:200]}")
+        store.touch_keepalive(aid, False, f"Keepalive auth failed: {str(exc)[:200]}")
         return {"ok": False, "id": aid, "label": acc.get("label", aid), "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
-        store.touch_keepalive(aid, None, f"保活未确认（保留账号状态）: {str(exc)[:200]}")
+        store.touch_keepalive(aid, None, f"Keepalive unconfirmed (retaining status): {str(exc)[:200]}")
         return {"ok": False, "id": aid, "label": acc.get("label", aid), "error": str(exc)}
 
 
@@ -1821,7 +1929,7 @@ async def run_keepalive_all(force: bool = False) -> dict:
                     or (a.get("ok") is not True)
                 )
                 if not needs_run:
-                    skipped.append({"id": aid, "label": label, "reason": "会话充足且近期已保活"})
+                    skipped.append({"id": aid, "label": label, "reason": "Session active and recently refreshed"})
                     continue
 
                 log.info("【自动保活】正在为账号 %s (%s) 执行静默续期与 VM 唤醒...", label, aid)
@@ -2222,7 +2330,7 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 async def _startup():
     for task in list(store.tasks.values()):
         if task.get("kind") == "image" and task.get("status") in ("queued", "processing"):
-            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+            store.update_task(task["id"], status="failed", error="Service restart interrupted task, please resubmit")
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)

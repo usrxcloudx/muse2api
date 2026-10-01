@@ -1,67 +1,65 @@
-Muse2API Cookie 导入扩展 —— 安装说明
-=====================================
+Muse2API Cookie Importer —— Hướng dẫn cài đặt
+===================================================
 
-这个扩展只做一件事：把你浏览器里 muse.ai 的登录 Cookie
-同步到你的 muse2api 服务。不用装 Python、不用开终端。
+Tiện ích này chỉ làm một việc duy nhất: Đồng bộ Cookie đăng nhập muse.ai
+từ trình duyệt của bạn vào dịch vụ muse2api. Không cần cài Python, không cần mở terminal.
 
 
-一、解压
---------
-把 muse2api-extension.zip 解压到一个你不会删掉的目录，例如：
+I. Giải nén
+-----------
+Giải nén muse2api-extension.zip vào thư mục cố định trên máy của bạn, ví dụ:
 
     Windows : D:\muse2api-extension
     macOS   : ~/Documents/muse2api-extension
+    Linux   : ~/workspace/ai-world/muse2api/extension
 
-解压后应该能看到 manifest.json、popup.html、popup.js 三个文件。
-
-
-二、在 Chrome / Edge 里加载
----------------------------
-Chrome：
-  1. 地址栏输入  chrome://extensions  回车
-  2. 打开右上角的「开发者模式」开关
-  3. 点左上角「加载已解压的扩展程序」
-  4. 选中第 1 步解压出来的那个文件夹（不是里面的单个文件）
-  5. 工具栏出现一个拼图图标，把它固定到工具栏（可选但方便）
-
-Edge：
-  1. 地址栏输入  edge://extensions  回车
-  2. 打开左下角「开发人员模式」
-  3. 点「加载解压缩的扩展」
-  4. 其余同上
-
-其他 Chromium 内核浏览器（Brave / Vivaldi / 360 极速 等）步骤类似。
+Sau khi giải nén sẽ có các tệp: manifest.json, popup.html, popup.js.
 
 
-三、使用
---------
-1. 先在这个浏览器里打开 https://muse.ai/ 并登录，
-   登录到能看到聊天界面为止。
-2. 到 muse2api 管理页「账号池」页顶部，复制 BASE URL 和 API Key。
-3. 点浏览器工具栏上的扩展图标，把这两项填进去（只需要填一次，会记住）。
-4. 点「读取并导入」。看到「✓ 导入成功」就完成了。
+II. Cài đặt vào Chrome / Edge
+-----------------------------
+Google Chrome:
+  1. Nhập  chrome://extensions  vào thanh địa chỉ rồi nhấn Enter
+  2. Bật công tắc «Chế độ cho nhà phát triển» ở góc trên bên phải
+  3. Nhấn vào «Tải tiện ích đã giải nén» ở góc trên bên trái
+  4. Chọn thư mục vừa giải nén (chọn cả thư mục, không phải từng file riêng lẻ)
+  5. Nhấn vào biểu tượng mảnh ghép và ghim tiện ích ra thanh công cụ
+
+Microsoft Edge:
+  1. Nhập  edge://extensions  vào thanh địa chỉ rồi nhấn Enter
+  2. Bật công tắc «Chế độ nhà phát triển» ở góc dưới bên trái
+  3. Nhấn «Tải phần mở rộng chưa đóng gói»
+  4. Các bước tiếp theo tương tự như Chrome
+
+Các trình duyệt Chromium khác (Brave, Cốc Cốc, Vivaldi, Opera) thực hiện tương tự.
 
 
-四、常见问题
-------------
-Q: 提示「没读到 muse.ai 的 Cookie」
-A: 说明这个浏览器里还没登录 muse.ai。先打开 https://muse.ai/ 登录。
-
-Q: 提示「缺核心项 hatch_sess 等」
-A: 同上 —— 登录没完成。确认能看到聊天界面再点。
-
-Q: 提示「API Key 不对（服务返回 401）」
-A: 到管理页重新复制一次 API Key。注意 Key 以 m2a_ 开头。
-
-Q: 提示跨域 / 网络错误
-A: 检查服务地址是不是 https，以及服务本身能不能打开
-   （浏览器直接访问 服务地址/admin 试试）。
-
-Q: 会不会把我的 Cookie 传到别的地方？
-A: 不会。扩展只有 cookies 和 storage 两个权限，代码就在 popup.js 里，
-   你可以自己看：它只往你填的那个服务地址发一个 POST，没有别的请求。
+III. Cách sử dụng
+-----------------
+1. Trên trình duyệt này, mở https://muse.ai/ và đăng nhập tài khoản cho tới khi vào được giao diện chat (https://muse.ai/thread/new).
+2. Vào trang quản trị muse2api (http://localhost:18610/admin), sao chép BASE URL và API Key ở đầu trang.
+3. Nhấn vào biểu tượng tiện ích Muse2API trên thanh công cụ, điền 2 thông tin trên vào (tiện ích sẽ tự lưu cho lần sau).
+4. Nhấn nút «Đọc và Nhập Cookie». Khi thông báo «✓ Nhập tài khoản thành công» xuất hiện là hoàn tất.
 
 
-五、卸载
---------
-chrome://extensions → 找到「Muse2API Cookie 导入」→ 移除。
+IV. Câu hỏi thường gặp
+----------------------
+Q: Báo lỗi «Không tìm thấy Cookie nào của muse.ai»
+A: Trình duyệt chưa đăng nhập tài khoản muse.ai. Hãy mở https://muse.ai/ và đăng nhập trước.
+
+Q: Báo lỗi «Thiếu mục cốt lõi hatch_vml...»
+A: Chưa mở tới giao diện chat. Hãy vào https://muse.ai/thread/new, gửi thử 1 câu chat rồi bấm nhập lại.
+
+Q: Báo lỗi «API Key không chính xác (Mã lỗi 401)»
+A: Vào trang quản trị sao chép lại API Key (bắt đầu bằng m2a_...).
+
+Q: Báo lỗi mạng / CORS
+A: Kiểm tra địa chỉ dịch vụ và xác nhận container docker muse2api đang chạy bình thường.
+
+Q: Tiện ích có làm lộ cookie hay gửi đi nơi khác không?
+A: Tuyệt đối không. Tiện ích chỉ dùng quyền cookies và storage nội bộ, chỉ gửi POST duy nhất về địa chỉ server do chính bạn cung cấp. Mã nguồn hoàn toàn mở trong popup.js.
+
+
+V. Gỡ cài đặt
+-------------
+chrome://extensions → Tìm «Muse2API Cookie Importer» → Nhấn Xóa (Remove).
