@@ -395,11 +395,9 @@ def build_image_prompt(r: ImageRequest) -> str:
 
     has_ref = bool(r.reference_image or r.image or r.images)
     if has_ref:
-        parts = [f"Image generation/editing based on attached reference image: {raw_prompt}"]
+        parts = [f"Based on the attached reference image, generate and edit an image: {raw_prompt}"]
     else:
-        # Nếu prompt đã có chỉ thị rõ ràng (như 'tạo cho tôi hình ảnh...', 'draw...', 'generate...')
-        # thì truyền trực tiếp prompt sạch để muse.ai xử lý tự nhiên nhất, tránh nhồi ngữ cảnh dài dòng
-        parts = [raw_prompt]
+        parts = [f"Please generate and draw a brand new high-quality image directly based on this description (generate the image now, do not reply with text only): {raw_prompt}"]
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
 
@@ -493,6 +491,8 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
                     last = lines[-1]
                     if not last.startswith(("```", "#", "-", "*", "[Skill")):
                         text = last
+            # Bóc tách các tiền tố slash command như /muse-ai —, /muse-image —, /image —
+            text = re.sub(r"^/([a-zA-Z0-9_\-]+)\s*(—|-|:)?\s*", "", text).strip()
         clean_turns.append((role, text))
     turns = clean_turns
 
@@ -673,8 +673,12 @@ def build_video_prompt(r: VideoRequest) -> str:
         else:
             parts.append(f"Generate an animated image-to-video based on reference image (16:9, duration {dur}s): {user_prompt}")
     else:
-        # Nếu không có ref image, gửi prompt trực tiếp để tránh thêm ngữ cảnh dài dòng
-        parts.append(user_prompt)
+        if is_vertical:
+            parts.append(f"Please generate and create a brand new 9:16 vertical video directly based on this description (generate video now, 9:16 vertical, duration {dur}s): {user_prompt}")
+        elif any(k in ar or k in sz for k in ("16:9", "16/9", "landscape", "横屏", "1280x720", "1920x1080")):
+            parts.append(f"Please generate and create a brand new 16:9 widescreen video directly based on this description (generate video now, 16:9 widescreen, duration {dur}s): {user_prompt}")
+        else:
+            parts.append(f"Please generate and create a brand new video directly based on this description (generate video now, duration {dur}s): {user_prompt}")
 
     if r.resolution:
         parts.append(f"Resolution: {r.resolution}")
@@ -1200,36 +1204,72 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     # 智能意图识别：如果用户在 chat 对话中要求生成/绘制图片或视频，且未强制走 tools
     # 自动重定向至真实生成引擎，避免在文本流中无限等待附件导致超时
+    has_muse_skill = any(
+        ("muse-ai" in (m.content if isinstance(m.content, str) else "") or
+         "/muse" in (m.content if isinstance(m.content, str) else ""))
+        for m in (req.messages or [])
+    )
+    is_text_q = any(q in prompt.lower() for q in (
+        "bạn là ai", "hướng dẫn", "giải thích", "ai tạo ra", "who are you", "what can you do", "help me understand"
+    ))
+
     img_kw = (
         "tạo ảnh", "vẽ ảnh", "sinh ảnh", "vẽ hình", "tạo hình ảnh", "tạo bức ảnh",
-        "vẽ bức ảnh", "tạo hình", "vẽ cho tôi", "tạo cho tôi hình ảnh", "tạo một bức ảnh",
-        "vẽ một bức ảnh", "vẽ tranh", "tạo tranh", "chụp ảnh", "phác họa",
+        "vẽ bức ảnh", "tạo hình", "vẽ cho tôi", "tạo cho tôi", "tạo một", "tạo 1",
+        "vẽ một", "vẽ 1", "vẽ giúp", "vẽ hộ", "vẽ tranh", "tạo tranh", "chụp ảnh",
+        "phác họa", "phác thảo", "khung cảnh", "bối cảnh", "tạo cảnh", "vẽ cảnh",
+        "dựng cảnh", "hình nền", "wallpaper", "poster", "avatar", "chân dung",
+        "minh họa", "vẽ minh họa", "tạo minh họa", "bức tranh", "bức họa",
         "生图", "画图", "生成图片", "绘制", "画一张", "作图", "文生图",
         "generate image", "create image", "draw an image", "draw a picture",
         "generate a picture", "paint an image", "make an image", "text to image",
-        "generate an image", "create an image"
+        "generate an image", "create an image", "generate a scene", "create a scene",
+        "draw a scene", "illustration", "render a scene", "render"
     )
     vid_kw = (
         "tạo video", "làm video", "sinh video", "tạo clip", "quay video", "làm clip",
-        "generate video", "create video", "make a video", "text to video", "generate a video"
-    )
-    is_img_req = (model == "muse-image") or (
-        not tool_note and len(prompt) < 1000 and any(k in prompt.lower() for k in img_kw)
+        "dựng video", "dựng clip", "generate video", "create video", "make a video",
+        "text to video", "generate a video"
     )
     is_vid_req = (model == "muse-video") or (
         not tool_note and len(prompt) < 1000 and any(k in prompt.lower() for k in vid_kw)
+    )
+    is_img_req = (model == "muse-image") or (
+        not is_vid_req and not tool_note and len(prompt) < 1000 and (
+            any(k in prompt.lower() for k in img_kw) or (has_muse_skill and not is_text_q)
+        )
     )
 
     if is_img_req or is_vid_req:
         media_kind = "video" if is_vid_req else "image"
         clean_prompt = prompt
-        for prefix in ("vui lòng ", "hãy ", "làm ơn ", "please ", "can you "):
+        prefixes = (
+            "vui lòng ", "hãy ", "làm ơn ", "please ", "can you ",
+            "tạo cho tôi một bức ảnh ", "tạo cho tôi 1 bức ảnh ", "tạo cho tôi bức ảnh ",
+            "tạo cho tôi hình ảnh ", "tạo cho tôi một hình ảnh ", "tạo cho tôi 1 hình ảnh ",
+            "tạo cho tôi một khung cảnh ", "tạo cho tôi 1 khung cảnh ", "tạo cho tôi khung cảnh ",
+            "tạo cho tôi một ", "tạo cho tôi 1 ", "tạo cho tôi ",
+            "vẽ cho tôi một bức ảnh ", "vẽ cho tôi 1 bức ảnh ", "vẽ cho tôi bức ảnh ",
+            "vẽ cho tôi một ", "vẽ cho tôi 1 ", "vẽ cho tôi ",
+            "tạo một bức ảnh ", "tạo 1 bức ảnh ", "tạo bức ảnh ",
+            "tạo một khung cảnh ", "tạo 1 khung cảnh ", "tạo khung cảnh ",
+            "tạo một ", "tạo 1 ", "tạo ảnh ", "vẽ ảnh ", "vẽ một ", "vẽ 1 ", "vẽ ",
+            "generate an image of ", "generate image of ", "create an image of ", "create image of ",
+            "draw an image of ", "draw a picture of ", "draw "
+        )
+        for prefix in prefixes:
             if clean_prompt.lower().startswith(prefix):
                 clean_prompt = clean_prompt[len(prefix):].strip()
+                break
 
         gen_timeout = int(req.timeout or (CFG.video_timeout if is_vid_req else CFG.image_timeout) or 240)
+        if is_vid_req:
+            target_prompt = build_video_prompt(VideoRequest(prompt=clean_prompt))
+        else:
+            target_prompt = build_image_prompt(ImageRequest(prompt=clean_prompt))
+
         try:
-            res, _acc = await asyncio.to_thread(_run_generation, clean_prompt, media_kind, gen_timeout)
+            res, _acc = await asyncio.to_thread(_run_generation, target_prompt, media_kind, gen_timeout)
             file_url = media_url(res["filename"])
             host_media_dir = os.environ.get("MUSE2API_HOST_MEDIA_DIR") or os.path.abspath(CFG.media_dir)
             host_path = os.path.join(host_media_dir, res["filename"])
@@ -1254,7 +1294,24 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 }
         except Exception as exc:
-            log.warning("Tự động chuyển tiếp sinh media (%s) thất bại, quay về luồng chat thường: %s", media_kind, exc)
+            log.warning("Tự động chuyển tiếp sinh media (%s) thất bại: %s", media_kind, exc)
+            err_text = f"Không thể tạo {media_kind} do: {str(exc)}"
+            if req.stream:
+                def gen_err_stream():
+                    yield _sse(_chat_chunk(cid, created, model, {"content": err_text}))
+                    yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(gen_err_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+            else:
+                return {
+                    "id": cid, "object": "chat.completion", "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": err_text}
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                }
 
     timeout = int(req.timeout or CFG.chat_timeout)
     acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
