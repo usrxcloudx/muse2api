@@ -515,6 +515,86 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
     return "\n\n".join(parts)
 
 
+def is_title_generation_request(req: ChatRequest, prompt: str) -> bool:
+    """Kiểm tra xem request có phải là yêu cầu tạo tiêu đề phiên trò chuyện (title generation / titling) từ client (Hermes, OpenWebUI...) hay không."""
+    rf = req.response_format
+    if rf:
+        rf_str = json.dumps(rf) if isinstance(rf, (dict, list)) else str(rf)
+        if "session_title" in rf_str or '"title"' in rf_str:
+            return True
+
+    title_phrases = (
+        "you name chat sessions", "write a title", "session_title",
+        "generate a title", "suggest a title", "create a title",
+        "generate a 3-5 word title", "generate a short title",
+        "given the user's opening message, write a title",
+        "reply with json only: {\"title\":"
+    )
+    for m in (req.messages or []):
+        r = (m.role or "").strip().lower()
+        if r in ("system", "developer"):
+            c = _content_text(m.content).lower()
+            if any(p in c for p in title_phrases):
+                return True
+
+    p_lower = prompt.lower()
+    return any(p in p_lower for p in title_phrases)
+
+
+def derive_clean_title(raw_text: str) -> str:
+    """Tạo tiêu đề ngắn gọn, xúc tích từ thông điệp của người dùng mà không cần gọi model LLM bên ngoài."""
+    text = (raw_text or "").strip()
+    m = re.search(r"The user has provided the following instruction alongside the skill invocation:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        text = m.group(1).strip()
+    elif text.startswith("[IMPORTANT:") and ("\n" in text):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines:
+            text = lines[-1]
+    # Bóc tách slash commands
+    text = re.sub(r"^/([a-zA-Z0-9_\-]+)\s*(—|-|:)?\s*", "", text).strip()
+
+    prefixes = (
+        "vui lòng ", "hãy ", "làm ơn ", "please ", "can you ",
+        "tạo cho tôi một bức ảnh ", "tạo cho tôi 1 bức ảnh ", "tạo cho tôi bức ảnh ",
+        "tạo cho tôi hình ảnh ", "tạo cho tôi một hình ảnh ", "tạo cho tôi 1 hình ảnh ",
+        "tạo cho tôi một khung cảnh ", "tạo cho tôi 1 khung cảnh ", "tạo cho tôi khung cảnh ",
+        "tạo cho tôi một video ", "tạo cho tôi 1 video ", "tạo cho tôi video ",
+        "tạo cho tôi một clip ", "tạo cho tôi 1 clip ", "tạo cho tôi clip ",
+        "tạo cho tôi một ", "tạo cho tôi 1 ", "tạo cho tôi ",
+        "vẽ cho tôi một bức ảnh ", "vẽ cho tôi 1 bức ảnh ", "vẽ cho tôi bức ảnh ",
+        "vẽ cho tôi một ", "vẽ cho tôi 1 ", "vẽ cho tôi ",
+        "tạo một bức ảnh ", "tạo 1 bức ảnh ", "tạo bức ảnh ",
+        "tạo một hình ảnh ", "tạo 1 hình ảnh ", "tạo hình ảnh ",
+        "tạo một khung cảnh ", "tạo 1 khung cảnh ", "tạo khung cảnh ",
+        "tạo một video ", "tạo 1 video ", "tạo video ",
+        "tạo một clip ", "tạo 1 clip ", "tạo clip ",
+        "tạo một ", "tạo 1 ", "vẽ một bức ảnh ", "vẽ 1 bức ảnh ", "vẽ bức ảnh ",
+        "vẽ một hình ảnh ", "vẽ 1 hình ảnh ", "vẽ hình ảnh ", "vẽ một ", "vẽ 1 ",
+        "generate an image of ", "generate a picture of ", "generate image of ",
+        "create an image of ", "create a picture of ", "create image of ",
+        "draw an image of ", "draw a picture of ", "draw image of ",
+        "generate a video of ", "generate video of ", "create a video of ", "create video of ",
+        "generate a ", "generate an ", "generate ",
+        "create a ", "create an ", "create "
+    )
+    changed = True
+    while changed:
+        changed = False
+        lower = text.lower()
+        for p in prefixes:
+            if lower.startswith(p):
+                text = text[len(p):].strip()
+                changed = True
+                break
+
+    if text:
+        text = text[0].upper() + text[1:]
+    if len(text) > 50:
+        text = text[:47] + "..."
+    return text or "Untitled Session"
+
+
 # ------------------------- 工具调用（function calling）适配 -------------------------
 # muse.ai 的网页模型**不会**返回结构化的 tool_calls，所以这里做一层协议适配：
 #   1) 请求带 tools 时，把工具定义翻译成提示词里的【工具调用协议】；
@@ -1202,6 +1282,43 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
+    # 自动识别并快速响应会话命名请求（title_generation），避免误触发媒体生成或无谓调用 muse.ai 创建冗余对话
+    is_title_req = is_title_generation_request(req, prompt)
+    if is_title_req:
+        user_msg = ""
+        for m in reversed(req.messages or []):
+            if (m.role or "").strip().lower() == "user":
+                user_msg = _content_text(m.content)
+                break
+        if not user_msg and req.prompt:
+            user_msg = req.prompt
+        clean_title = derive_clean_title(user_msg)
+
+        wants_json = bool(req.response_format) or any(
+            "json" in _content_text(m.content).lower()
+            for m in (req.messages or [])
+            if (m.role or "").strip().lower() in ("system", "developer")
+        ) or "json" in prompt.lower()
+
+        resp_content = json.dumps({"title": clean_title}, ensure_ascii=False) if wants_json else clean_title
+
+        if req.stream:
+            def gen_title_stream():
+                yield _sse(_chat_chunk(cid, created, model, {"content": resp_content}))
+                yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(gen_title_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+        else:
+            return {
+                "id": cid, "object": "chat.completion", "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": resp_content}
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }
+
     # 智能意图识别：如果用户在 chat 对话中要求生成/绘制图片或视频，且未强制走 tools
     # 自动重定向至真实生成引擎，避免在文本流中无限等待附件导致超时
     has_muse_skill = any(
@@ -1231,14 +1348,14 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         "dựng video", "dựng clip", "generate video", "create video", "make a video",
         "text to video", "generate a video"
     )
-    is_vid_req = (model == "muse-video") or (
+    is_vid_req = not is_title_req and ((model == "muse-video") or (
         not tool_note and len(prompt) < 1000 and any(k in prompt.lower() for k in vid_kw)
-    )
-    is_img_req = (model == "muse-image") or (
+    ))
+    is_img_req = not is_title_req and ((model == "muse-image") or (
         not is_vid_req and not tool_note and len(prompt) < 1000 and (
             any(k in prompt.lower() for k in img_kw) or (has_muse_skill and not is_text_q)
         )
-    )
+    ))
 
     if is_img_req or is_vid_req:
         media_kind = "video" if is_vid_req else "image"
